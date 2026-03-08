@@ -1,0 +1,15 @@
+{
+  "name": "white-block",
+  "displayName": "White Block",
+  "description": "Facilitate common operations",
+  "version": "0.1.0",
+  "author": "Playsthetic",
+  "license": "MIT",
+  "contributes": {
+    "scripts": [
+      {
+        "path": "./plugin.lua"
+      }
+    ]
+  }
+}
