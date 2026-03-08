@@ -165,68 +165,34 @@ local function exportLayerPNG(layer, outputPath, fromFrame, toFrame, spr, paddin
     return app.fs.isFile(outputPath)
 end
 
--- Writes the JSON layout manifest to manifestPath.
--- Each entry's path is already the correct relative path from the JSON to the image.
-local function writeManifest(entries, manifestPath)
-    -- Sort keys for stable, diffable output
-    local keys = {}
-    for k in pairs(entries) do table.insert(keys, k) end
-    table.sort(keys)
 
-    local layerLines = {}
-    for _, key in ipairs(keys) do
-        local e = entries[key]
-        local mask    = e.mask    and ',\n      "mask": true' or ""
-        local scale   = e.scale   and string.format(',\n      "scale": [%d, %d]', e.scale[1], e.scale[2]) or ""
-        local padding = e.padding and string.format(',\n      "padding": %d', e.padding) or ""
-        table.insert(layerLines, string.format(
-            '    "%s": {\n      "image": "%s",\n      "x": %d,\n      "y": %d,\n      "z": %d%s%s%s\n    }',
-            key, e.path, e.x, e.y, e.z, mask, scale, padding
-        ))
-    end
-
-    local json = '{\n  "layers": {\n' .. table.concat(layerLines, ',\n') .. '\n  }\n}\n'
-
-    local f = io.open(manifestPath, "w")
-    if not f then
-        app.alert("Could not write manifest to:\n" .. manifestPath)
-        return false
-    end
-    f:write(json)
-    f:close()
-    return manifestPath
-end
-
--- Serializes a hierarchy node to a JSON string with `indent` levels of indentation
--- for its content. Group nodes carry { x, y, z, children }; leaf nodes carry
--- { path, x, y, z } plus optional mask/scale/padding fields.
+-- Serializes a hierarchy node to a JSON string with `indent` levels of indentation.
+-- Group nodes carry { name, x, y, children }; leaf nodes carry { name, image, x, y, ... }.
+-- false entries in children arrays are skipped (failed left-instance placeholders).
 local function nodeToJson(node, indent)
     local pad      = string.rep("  ", indent)
     local outerPad = indent > 0 and string.rep("  ", indent - 1) or ""
     local parts    = {}
+    table.insert(parts, string.format('"name": "%s"', node.name))
     if node.children then
         table.insert(parts, string.format('"x": %d', node.x))
         table.insert(parts, string.format('"y": %d', node.y))
-        table.insert(parts, string.format('"z": %d', node.z))
-        local childKeys = {}
-        for k in pairs(node.children) do table.insert(childKeys, k) end
-        table.sort(childKeys)
-        if #childKeys > 0 then
-            local childLines = {}
-            for _, ck in ipairs(childKeys) do
-                table.insert(childLines,
-                    pad .. '  "' .. ck .. '": ' .. nodeToJson(node.children[ck], indent + 2))
+        local childLines = {}
+        for _, child in ipairs(node.children) do
+            if child then
+                table.insert(childLines, pad .. '  ' .. nodeToJson(child, indent + 2))
             end
-            table.insert(parts, '"children": {\n' ..
-                table.concat(childLines, ',\n') .. '\n' .. pad .. '}')
+        end
+        if #childLines > 0 then
+            table.insert(parts, '"children": [\n' ..
+                table.concat(childLines, ',\n') .. '\n' .. pad .. ']')
         else
-            table.insert(parts, '"children": {}')
+            table.insert(parts, '"children": []')
         end
     else
-        table.insert(parts, string.format('"image": "%s"', node.path))
+        table.insert(parts, string.format('"image": "%s"', node.image))
         table.insert(parts, string.format('"x": %d', node.x))
         table.insert(parts, string.format('"y": %d', node.y))
-        table.insert(parts, string.format('"z": %d', node.z))
         if node.mask    then table.insert(parts, '"mask": true') end
         if node.scale   then table.insert(parts, string.format('"scale": [%d, %d]',
             node.scale[1], node.scale[2])) end
@@ -237,15 +203,15 @@ local function nodeToJson(node, indent)
 end
 
 -- Writes a hierarchical JSON layout manifest to manifestPath.
+-- root is an ordered array of nodes (bottom-to-top).
 local function writeHierarchicalManifest(root, manifestPath)
-    local rootKeys = {}
-    for k in pairs(root) do table.insert(rootKeys, k) end
-    table.sort(rootKeys)
-    local topLines = {}
-    for _, k in ipairs(rootKeys) do
-        table.insert(topLines, '    "' .. k .. '": ' .. nodeToJson(root[k], 3))
+    local lines = {}
+    for _, node in ipairs(root) do
+        if node then
+            table.insert(lines, '    ' .. nodeToJson(node, 3))
+        end
     end
-    local json = '{\n  "layers": {\n' .. table.concat(topLines, ',\n') .. '\n  }\n}\n'
+    local json = '{\n  "layers": [\n' .. table.concat(lines, ',\n') .. '\n  ]\n}\n'
     local f = io.open(manifestPath, "w")
     if not f then
         app.alert("Could not write manifest to:\n" .. manifestPath)
@@ -543,33 +509,31 @@ local function run(plugin)
     if groupTransform then
         -- -----------------------------------------------------------------------
         -- Hierarchical mode: groups become parent transform nodes.
-        -- Positions of children are expressed relative to their parent's center.
-        -- z is 1-based within each sibling set (1 = bottommost).
+        -- Positions of children are relative to their parent's center.
+        -- Output is ordered arrays (bottom-to-top); draw order is implicit.
         -- -----------------------------------------------------------------------
 
-        -- Recursively builds the hierarchy table for a container's children.
+        -- Recursively builds an ordered array of nodes for a container's children.
         -- parentCX/parentCY: canvas-space center of the parent (0,0 at root).
         local function buildHierarchyNode(container, parentCX, parentCY)
             local result = {}
-            local z = 0
             -- Iterate bottom-to-top (index 1 = bottommost in Aseprite).
             for i = 1, #container.layers do
                 local layer = container.layers[i]
                 if isEffectivelyVisible(layer) then
                     local path = getPath(layer)
                     if not shouldSkip(path) then
-                        z = z + 1
                         if layer.isGroup then
                             local bx1, by1, bx2, by2 = getGroupBounds(layer, frame)
                             if bx1 then
                                 local cx = math.floor((bx1 + bx2) / 2 + 0.5)
                                 local cy = math.floor((by1 + by2) / 2 + 0.5)
-                                result[layer.name] = {
+                                table.insert(result, {
+                                    name     = layer.name,
                                     x        = cx - parentCX,
                                     y        = cy - parentCY,
-                                    z        = z,
                                     children = buildHierarchyNode(layer, cx, cy),
-                                }
+                                })
                             end
                         elseif layer.isImage then
                             local cx, cy = getCenter(layer, frame)
@@ -578,24 +542,28 @@ local function run(plugin)
                                 local filename = makeFilename(path, baseKey)
                                 local isMask   = layer.name:lower():sub(-#"mask") == "mask"
                                 if leftInstanceKeys[baseKey] then
-                                    -- Defer: right-instance must be exported first.
+                                    -- Reserve a slot; fill after the right-instance is exported.
+                                    local pos = #result + 1
+                                    result[pos] = false
                                     table.insert(pendingLeft, {
-                                        result   = result,
-                                        name     = layer.name,
+                                        arr     = result,
+                                        pos     = pos,
+                                        name    = layer.name,
                                         filename = filename,
-                                        imgPath  = makeImagePath(filename),
-                                        x = cx - parentCX, y = cy - parentCY, z = z,
-                                        mask     = isMask or nil,
-                                        padding  = padding > 0 and padding or nil,
+                                        imgPath = makeImagePath(filename),
+                                        x = cx - parentCX, y = cy - parentCY,
+                                        mask    = isMask or nil,
+                                        padding = padding > 0 and padding or nil,
                                     })
                                 else
                                     if exportLeaf(layer, filename) then
-                                        result[layer.name] = {
-                                            path    = makeImagePath(filename),
-                                            x = cx - parentCX, y = cy - parentCY, z = z,
+                                        table.insert(result, {
+                                            name    = layer.name,
+                                            image   = makeImagePath(filename),
+                                            x = cx - parentCX, y = cy - parentCY,
                                             mask    = isMask or nil,
                                             padding = padding > 0 and padding or nil,
-                                        }
+                                        })
                                     end
                                 end
                             else
@@ -613,9 +581,10 @@ local function run(plugin)
             hierarchicalManifest = buildHierarchyNode(spr, 0, 0)
             for _, e in ipairs(pendingLeft) do
                 if exportedFiles[e.filename] then
-                    e.result[e.name] = {
-                        path    = e.imgPath,
-                        x = e.x, y = e.y, z = e.z,
+                    e.arr[e.pos] = {
+                        name    = e.name,
+                        image   = e.imgPath,
+                        x = e.x, y = e.y,
                         mask    = e.mask,
                         scale   = { -1, 1 },
                         padding = e.padding,
@@ -627,19 +596,21 @@ local function run(plugin)
         manifestPath = writeHierarchicalManifest(hierarchicalManifest, jsonPath)
     else
         -- -----------------------------------------------------------------------
-        -- Flat mode: original behavior — one entry per leaf in a flat table.
+        -- Flat mode: one entry per leaf, ordered bottom-to-top.
         -- -----------------------------------------------------------------------
         local manifest  = {}
         local pathIndex = {}   -- baseKey → occurrence count (handles path collisions)
         app.transaction("White Block Export", function()
-            for i, layer in ipairs(leaves) do
+            -- leaves[1] is topmost; iterate in reverse for bottom-to-top array order.
+            for i = total, 1, -1 do
+                local layer = leaves[i]
                 local path = getPath(layer)
                 if not shouldSkip(path) then
                     local asMask  = layer.name:lower():sub(-#"mask") == "mask"
                     local baseKey = table.concat(path, "-")
                     pathIndex[baseKey] = (pathIndex[baseKey] or 0) + 1
                     local idx = pathIndex[baseKey]
-                    local key = idx == 1 and baseKey or (baseKey .. "-" .. idx)
+                    local name = idx == 1 and baseKey or (baseKey .. "-" .. idx)
                     local filename = makeFilename(path, baseKey)
                     if not sharedFilenames[baseKey] and idx > 1 then
                         filename = filename .. sep .. idx
@@ -648,31 +619,39 @@ local function run(plugin)
                     if cx == nil then
                         table.insert(warnings, "Empty layer skipped: " .. layer.name)
                     elseif leftInstanceKeys[baseKey] then
-                        -- Defer: capture position now, add manifest entry after right is exported.
+                        -- Reserve a slot; fill after the right-instance is exported.
+                        local pos = #manifest + 1
+                        manifest[pos] = false
                         table.insert(pendingLeft, {
-                            key = key, filename = filename, path = makeImagePath(filename),
-                            x = cx, y = cy, z = total - i + 1, mask = asMask,
+                            arr     = manifest,
+                            pos     = pos,
+                            name    = name,
+                            filename = filename,
+                            imgPath = makeImagePath(filename),
+                            x = cx, y = cy,
+                            mask    = asMask or nil,
                             padding = padding > 0 and padding or nil,
                         })
                     else
                         if exportLeaf(layer, filename) then
-                            manifest[key] = {
-                                path    = makeImagePath(filename),
+                            table.insert(manifest, {
+                                name    = name,
+                                image   = makeImagePath(filename),
                                 x = cx, y = cy,
-                                z = total - i + 1,
-                                mask    = asMask,
+                                mask    = asMask or nil,
                                 padding = padding > 0 and padding or nil,
-                            }
+                            })
                         end
                     end
                 end
             end
-            -- Add deferred left-instance entries now that their right counterparts are exported.
+            -- Fill in deferred left-instance slots.
             for _, e in ipairs(pendingLeft) do
                 if exportedFiles[e.filename] then
-                    manifest[e.key] = {
-                        path    = e.path,
-                        x = e.x, y = e.y, z = e.z,
+                    e.arr[e.pos] = {
+                        name    = e.name,
+                        image   = e.imgPath,
+                        x = e.x, y = e.y,
                         mask    = e.mask,
                         scale   = { -1, 1 },
                         padding = e.padding,
@@ -683,7 +662,7 @@ local function run(plugin)
         -- Undo the transaction to restore the document to its pre-export state,
         -- clearing the dirty flag so the user is not prompted to save.
         app.command.Undo()
-        manifestPath = writeManifest(manifest, jsonPath)
+        manifestPath = writeHierarchicalManifest(manifest, jsonPath)
     end
 
     if not manifestPath then
