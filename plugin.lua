@@ -6,7 +6,7 @@
 -- Rules:
 --   Hidden layers are not exported.
 --   Layers/groups whose name ends with "preview" are skipped (children too).
---   Layers whose name ends with "mask" are exported and flagged in the manifest.
+--   Layers whose name ends with "mask" are exported normally; the name identifies them.
 --   Groups are never exported as composites — only used for naming.
 
 -- ---------------------------------------------------------------------------
@@ -276,7 +276,6 @@ local function nodeToJson(node, indent)
         table.insert(parts, string.format('"image": "%s"', node.image))
         table.insert(parts, string.format('"x": %d', node.x))
         table.insert(parts, string.format('"y": %d', node.y))
-        if node.mask    then table.insert(parts, '"mask": true') end
         if node.scale   then table.insert(parts, string.format('"scale": [%d, %d]',
             node.scale[1], node.scale[2])) end
         if node.padding then table.insert(parts, string.format('"padding": %d',
@@ -643,7 +642,6 @@ local function run(plugin)
                                 else
                                     local baseKey  = table.concat(path, "-")
                                     local filename = makeFilename(path, baseKey) .. tableSuffix(layer)
-                                    local isMask   = lname:sub(-#"mask") == "mask"
                                     if leftInstanceKeys[baseKey] then
                                         -- Reserve a slot; fill after the right-instance is exported.
                                         local pos = #result + 1
@@ -655,7 +653,6 @@ local function run(plugin)
                                             filename = filename,
                                             imgPath  = makeImagePath(filename),
                                             x = cx - parentCX, y = cy - parentCY,
-                                            mask    = isMask or nil,
                                             padding = padding > 0 and padding or nil,
                                         })
                                     else
@@ -664,7 +661,6 @@ local function run(plugin)
                                                 name    = cleanDisplayName(layer.name),
                                                 image   = makeImagePath(filename),
                                                 x = cx - parentCX, y = cy - parentCY,
-                                                mask    = isMask or nil,
                                                 padding = padding > 0 and padding or nil,
                                             })
                                         end
@@ -689,7 +685,6 @@ local function run(plugin)
                         name    = e.name,
                         image   = e.imgPath,
                         x = e.x, y = e.y,
-                        mask    = e.mask,
                         scale   = { -1, 1 },
                         padding = e.padding,
                     }
@@ -712,7 +707,6 @@ local function run(plugin)
                 if not shouldSkip(path) then
                     local lname  = layer.name:lower()
                     local isText = lname:sub(-#"text") == "text"
-                    local asMask = lname:sub(-#"mask") == "mask"
                     local baseKey = table.concat(path, "-")
                     pathIndex[baseKey] = (pathIndex[baseKey] or 0) + 1
                     local idx = pathIndex[baseKey]
@@ -749,7 +743,6 @@ local function run(plugin)
                                 filename = filename,
                                 imgPath  = makeImagePath(filename),
                                 x = cx, y = cy,
-                                mask    = asMask or nil,
                                 padding = padding > 0 and padding or nil,
                             })
                         else
@@ -758,7 +751,6 @@ local function run(plugin)
                                     name    = name,
                                     image   = makeImagePath(filename),
                                     x = cx, y = cy,
-                                    mask    = asMask or nil,
                                     padding = padding > 0 and padding or nil,
                                 })
                             end
@@ -773,7 +765,6 @@ local function run(plugin)
                         name    = e.name,
                         image   = e.imgPath,
                         x = e.x, y = e.y,
-                        mask    = e.mask,
                         scale   = { -1, 1 },
                         padding = e.padding,
                     }
