@@ -159,6 +159,39 @@ local function commonPrefixFilename(paths, leafName, prefix, sep)
     return table.concat(parts, sep)
 end
 
+-- Returns true when two cels contain identical pixel content.
+local function celsMatch(cel1, cel2)
+    local i1, i2 = cel1.image, cel2.image
+    if i1.width ~= i2.width or i1.height ~= i2.height then return false end
+    for y = 0, i1.height - 1 do
+        for x = 0, i1.width - 1 do
+            if i1:getPixel(x, y) ~= i2:getPixel(x, y) then return false end
+        end
+    end
+    return true
+end
+
+-- Returns an ordered array of frame numbers in [f1, f2] whose pixel content is
+-- unique (i.e. not pixel-equal to any earlier frame already in the list).
+local function getUniqueFrames(layer, f1, f2)
+    local nums = {}
+    local cels = {}
+    for f = f1, f2 do
+        local cel = layer:cel(f)
+        if cel then
+            local dup = false
+            for _, prev in ipairs(cels) do
+                if celsMatch(cel, prev) then dup = true; break end
+            end
+            if not dup then
+                table.insert(nums, f)
+                table.insert(cels, cel)
+            end
+        end
+    end
+    return nums
+end
+
 -- Exports a single layer over a frame range as a trimmed PNG.
 -- The layer is temporarily renamed to a sentinel name so ExportSpriteSheet's
 -- `layer` filter matches exactly one layer regardless of name collisions.
@@ -167,8 +200,30 @@ end
 local function exportLayerPNG(layer, outputPath, fromFrame, toFrame, spr, padding)
     local origName = layer.name
     local sentinel = "__wb_export_target__"
+
+    local uniqueNums = getUniqueFrames(layer, fromFrame, toFrame)
+    if #uniqueNums == 0 then return false end
+
     layer.name = sentinel
-    local tag = spr:newTag(fromFrame, toFrame)
+
+    -- When some frames are linked, build a temp sprite containing only unique frames
+    -- so the exported strip has no duplicate columns.
+    local tmpSpr
+    if #uniqueNums < toFrame - fromFrame + 1 then
+        tmpSpr = Sprite(spr.width, spr.height, spr.colorMode)
+        local tmpLayer = tmpSpr.layers[1]
+        tmpLayer.name = sentinel
+        while #tmpSpr.frames < #uniqueNums do tmpSpr:newFrame() end
+        for i, f in ipairs(uniqueNums) do
+            local cel = layer:cel(f)
+            tmpSpr:newCel(tmpLayer, i, cel.image, cel.position)
+        end
+    end
+
+    local target  = tmpSpr or spr
+    local tagFrom = tmpSpr and 1             or fromFrame
+    local tagTo   = tmpSpr and #uniqueNums   or toFrame
+    local tag = target:newTag(tagFrom, tagTo)
     tag.name = "__wb_export__"
     pcall(function()
         app.command.ExportSpriteSheet{
@@ -179,7 +234,7 @@ local function exportLayerPNG(layer, outputPath, fromFrame, toFrame, spr, paddin
             layer           = sentinel,
             tag             = "__wb_export__",
             trim            = true,
-            borderPadding   = padding or 0,
+            innerPadding    = padding or 0,
             ignoreEmpty     = false,
             splitLayers     = false,
             listLayers      = false,
@@ -187,7 +242,8 @@ local function exportLayerPNG(layer, outputPath, fromFrame, toFrame, spr, paddin
             listSlices      = false,
         }
     end)
-    spr:deleteTag(tag)
+    target:deleteTag(tag)
+    if tmpSpr then pcall(function() tmpSpr:close() end) end
     layer.name = origName
     return app.fs.isFile(outputPath)
 end
@@ -501,6 +557,19 @@ local function run(plugin)
     local exportedFiles = {}   -- filename → true/false
     local pendingLeft   = {}   -- left-instance entries deferred until after right exports
 
+    -- Returns the Playdate image-table suffix ("-table-W-H") when a layer has more
+    -- than one unique frame in the export range, otherwise returns "".
+    -- W and H are the dimensions of a single frame (trimmed content + padding on each side).
+    local function tableSuffix(layer)
+        local unique = getUniqueFrames(layer, fromFrame, toFrame)
+        if #unique <= 1 then return "" end
+        local cel = layer:cel(unique[1])
+        if not cel then return "" end
+        local tr = cel.image:shrinkBounds()
+        if tr.width == 0 or tr.height == 0 then return "" end
+        return string.format("-table-%d-%d", tr.width + 2 * padding, tr.height + 2 * padding)
+    end
+
     -- Returns the filename stem for a leaf layer, honouring shared-instance overrides.
     local function makeFilename(path, baseKey)
         if sharedFilenames[baseKey] then return sharedFilenames[baseKey] end
@@ -562,7 +631,7 @@ local function run(plugin)
                             local cx, cy = getCenter(layer, frame)
                             if cx then
                                 local baseKey  = table.concat(path, "-")
-                                local filename = makeFilename(path, baseKey)
+                                local filename = makeFilename(path, baseKey) .. tableSuffix(layer)
                                 local isMask   = layer.name:lower():sub(-#"mask") == "mask"
                                 if leftInstanceKeys[baseKey] then
                                     -- Reserve a slot; fill after the right-instance is exported.
@@ -642,7 +711,7 @@ local function run(plugin)
                         return parts
                     end)(), "-")
                     local name = idx == 1 and cleanKey or (cleanKey .. "-" .. idx)
-                    local filename = makeFilename(path, baseKey)
+                    local filename = makeFilename(path, baseKey) .. tableSuffix(layer)
                     if not sharedFilenames[baseKey] and idx > 1 then
                         filename = filename .. sep .. idx
                     end
