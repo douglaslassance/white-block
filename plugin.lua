@@ -366,7 +366,9 @@ local function run(plugin)
     -- Regular instances: deduplicate only when the same leaf name appears more than once.
     for leafName, paths in pairs(regularGroups) do
         if #paths > 1 then
-            local fname = commonPrefixFilename(paths, leafName, prefix, sep)
+            -- Strip "instance" suffix from the filename
+            local baseLeafName = leafName:sub(1, #leafName - #"instance")
+            local fname = commonPrefixFilename(paths, baseLeafName, prefix, sep)
             for _, p in ipairs(paths) do
                 sharedFilenames[table.concat(p, "-")] = fname
             end
@@ -413,7 +415,14 @@ local function run(plugin)
                     filename = sharedFilenames[baseKey]
                 else
                     local nameParts = prefix ~= "" and { prefix } or {}
-                    for _, p in ipairs(path) do table.insert(nameParts, p) end
+                    for _, p in ipairs(path) do
+                        -- Strip "instance" suffix from individual instance layers
+                        local part = p
+                        if part:lower():sub(-#"instance") == "instance" then
+                            part = part:sub(1, #part - #"instance")
+                        end
+                        table.insert(nameParts, part)
+                    end
                     filename = table.concat(nameParts, sep)
                     if idx > 1 then filename = filename .. sep .. idx end
                 end
