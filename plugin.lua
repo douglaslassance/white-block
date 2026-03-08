@@ -58,8 +58,8 @@ local function cleanName(name)
     return name
 end
 
--- Strips only the "-instance" suffix from a layer name, preserving directional
--- prefixes ("left", "right") so JSON name fields can differentiate mirrored pairs.
+-- Strips instance suffixes ("-instance") from a layer name for JSON display,
+-- preserving directional prefixes ("left", "right") so mirrored pairs stay distinct.
 local function cleanDisplayName(name)
     local lname = name:lower()
     if lname:sub(-#"-instance") == "-instance" then
@@ -250,8 +250,8 @@ end
 
 
 -- Serializes a hierarchy node to a JSON string with `indent` levels of indentation.
--- Group nodes carry { name, x, y, children }; leaf nodes carry { name, image, x, y, ... }.
--- false entries in children arrays are skipped (failed left-instance placeholders).
+-- Group nodes carry { name, x, y, children }; image nodes carry { name, image, x, y, ... };
+-- text nodes carry { name, x, y }. false entries in children are skipped (pending placeholders).
 local function nodeToJson(node, indent)
     local pad      = string.rep("  ", indent)
     local outerPad = indent > 0 and string.rep("  ", indent - 1) or ""
@@ -272,7 +272,7 @@ local function nodeToJson(node, indent)
         else
             table.insert(parts, '"children": []')
         end
-    else
+    elseif node.image then
         table.insert(parts, string.format('"image": "%s"', node.image))
         table.insert(parts, string.format('"x": %d', node.x))
         table.insert(parts, string.format('"y": %d', node.y))
@@ -281,6 +281,9 @@ local function nodeToJson(node, indent)
             node.scale[1], node.scale[2])) end
         if node.padding then table.insert(parts, string.format('"padding": %d',
             node.padding)) end
+    else
+        table.insert(parts, string.format('"x": %d', node.x))
+        table.insert(parts, string.format('"y": %d', node.y))
     end
     return '{\n' .. pad .. table.concat(parts, ',\n' .. pad) .. '\n' .. outerPad .. '}'
 end
@@ -630,32 +633,41 @@ local function run(plugin)
                         elseif layer.isImage then
                             local cx, cy = getCenter(layer, frame)
                             if cx then
-                                local baseKey  = table.concat(path, "-")
-                                local filename = makeFilename(path, baseKey) .. tableSuffix(layer)
-                                local isMask   = layer.name:lower():sub(-#"mask") == "mask"
-                                if leftInstanceKeys[baseKey] then
-                                    -- Reserve a slot; fill after the right-instance is exported.
-                                    local pos = #result + 1
-                                    result[pos] = false
-                                    table.insert(pendingLeft, {
-                                        arr     = result,
-                                        pos     = pos,
-                                        name    = cleanDisplayName(layer.name),
-                                        filename = filename,
-                                        imgPath = makeImagePath(filename),
+                                local lname  = layer.name:lower()
+                                local isText = lname:sub(-#"text") == "text"
+                                if isText then
+                                    table.insert(result, {
+                                        name = cleanDisplayName(layer.name),
                                         x = cx - parentCX, y = cy - parentCY,
-                                        mask    = isMask or nil,
-                                        padding = padding > 0 and padding or nil,
                                     })
                                 else
-                                    if exportLeaf(layer, filename) then
-                                        table.insert(result, {
-                                            name    = cleanDisplayName(layer.name),
-                                            image   = makeImagePath(filename),
+                                    local baseKey  = table.concat(path, "-")
+                                    local filename = makeFilename(path, baseKey) .. tableSuffix(layer)
+                                    local isMask   = lname:sub(-#"mask") == "mask"
+                                    if leftInstanceKeys[baseKey] then
+                                        -- Reserve a slot; fill after the right-instance is exported.
+                                        local pos = #result + 1
+                                        result[pos] = false
+                                        table.insert(pendingLeft, {
+                                            arr      = result,
+                                            pos      = pos,
+                                            name     = cleanDisplayName(layer.name),
+                                            filename = filename,
+                                            imgPath  = makeImagePath(filename),
                                             x = cx - parentCX, y = cy - parentCY,
                                             mask    = isMask or nil,
                                             padding = padding > 0 and padding or nil,
                                         })
+                                    else
+                                        if exportLeaf(layer, filename) then
+                                            table.insert(result, {
+                                                name    = cleanDisplayName(layer.name),
+                                                image   = makeImagePath(filename),
+                                                x = cx - parentCX, y = cy - parentCY,
+                                                mask    = isMask or nil,
+                                                padding = padding > 0 and padding or nil,
+                                            })
+                                        end
                                     end
                                 end
                             else
@@ -698,7 +710,9 @@ local function run(plugin)
                 local layer = leaves[i]
                 local path = getPath(layer)
                 if not shouldSkip(path) then
-                    local asMask  = layer.name:lower():sub(-#"mask") == "mask"
+                    local lname  = layer.name:lower()
+                    local isText = lname:sub(-#"text") == "text"
+                    local asMask = lname:sub(-#"mask") == "mask"
                     local baseKey = table.concat(path, "-")
                     pathIndex[baseKey] = (pathIndex[baseKey] or 0) + 1
                     local idx = pathIndex[baseKey]
@@ -711,36 +725,43 @@ local function run(plugin)
                         return parts
                     end)(), "-")
                     local name = idx == 1 and cleanKey or (cleanKey .. "-" .. idx)
-                    local filename = makeFilename(path, baseKey) .. tableSuffix(layer)
-                    if not sharedFilenames[baseKey] and idx > 1 then
-                        filename = filename .. sep .. idx
-                    end
                     local cx, cy = getCenter(layer, frame)
                     if cx == nil then
                         table.insert(warnings, "Empty layer skipped: " .. layer.name)
-                    elseif leftInstanceKeys[baseKey] then
-                        -- Reserve a slot; fill after the right-instance is exported.
-                        local pos = #manifest + 1
-                        manifest[pos] = false
-                        table.insert(pendingLeft, {
-                            arr     = manifest,
-                            pos     = pos,
-                            name    = name,
-                            filename = filename,
-                            imgPath = makeImagePath(filename),
+                    elseif isText then
+                        table.insert(manifest, {
+                            name = name,
                             x = cx, y = cy,
-                            mask    = asMask or nil,
-                            padding = padding > 0 and padding or nil,
                         })
                     else
-                        if exportLeaf(layer, filename) then
-                            table.insert(manifest, {
-                                name    = name,
-                                image   = makeImagePath(filename),
+                        local filename = makeFilename(path, baseKey) .. tableSuffix(layer)
+                        if not sharedFilenames[baseKey] and idx > 1 then
+                            filename = filename .. sep .. idx
+                        end
+                        if leftInstanceKeys[baseKey] then
+                            -- Reserve a slot; fill after the right-instance is exported.
+                            local pos = #manifest + 1
+                            manifest[pos] = false
+                            table.insert(pendingLeft, {
+                                arr      = manifest,
+                                pos      = pos,
+                                name     = name,
+                                filename = filename,
+                                imgPath  = makeImagePath(filename),
                                 x = cx, y = cy,
                                 mask    = asMask or nil,
                                 padding = padding > 0 and padding or nil,
                             })
+                        else
+                            if exportLeaf(layer, filename) then
+                                table.insert(manifest, {
+                                    name    = name,
+                                    image   = makeImagePath(filename),
+                                    x = cx, y = cy,
+                                    mask    = asMask or nil,
+                                    padding = padding > 0 and padding or nil,
+                                })
+                            end
                         end
                     end
                 end
