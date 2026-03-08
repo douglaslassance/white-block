@@ -80,7 +80,7 @@ end
 
 -- Given a set of full layer paths and a target leaf name, returns the deduplicated
 -- filename stem: scene + longest-common-prefix-of-all-paths + leafName.
-local function commonPrefixFilename(paths, leafName, scene, sep)
+local function commonPrefixFilename(paths, leafName, prefix, sep)
     local maxPrefix = math.huge
     for _, p in ipairs(paths) do maxPrefix = math.min(maxPrefix, #p - 1) end
     local prefixLen = 0
@@ -91,7 +91,7 @@ local function commonPrefixFilename(paths, leafName, scene, sep)
         end
         if allMatch then prefixLen = i else break end
     end
-    local parts = { scene }
+    local parts = prefix ~= "" and { prefix } or {}
     for i = 1, prefixLen do table.insert(parts, paths[1][i]) end
     table.insert(parts, leafName)
     return table.concat(parts, sep)
@@ -102,7 +102,7 @@ end
 -- `layer` filter matches exactly one layer regardless of name collisions.
 -- pcall ensures the original name and tag are always restored on failure.
 -- Sprite:newTag uses 1-indexed frame numbers (Lua convention).
-local function exportLayerPNG(layer, outputPath, fromFrame, toFrame, spr)
+local function exportLayerPNG(layer, outputPath, fromFrame, toFrame, spr, padding)
     local origName = layer.name
     local sentinel = "__wb_export_target__"
     layer.name = sentinel
@@ -117,6 +117,7 @@ local function exportLayerPNG(layer, outputPath, fromFrame, toFrame, spr)
             layer           = sentinel,
             tag             = "__wb_export__",
             trim            = true,
+            borderPadding   = padding or 0,
             ignoreEmpty     = false,
             splitLayers     = false,
             listLayers      = false,
@@ -129,10 +130,9 @@ local function exportLayerPNG(layer, outputPath, fromFrame, toFrame, spr)
     return app.fs.isFile(outputPath)
 end
 
--- Writes the JSON layout manifest file.
--- Image paths in the JSON are filenames only (no directory, no extension).
--- Layout.lua resolves them relative to the JSON's own location at runtime.
-local function writeManifest(scene, entries, outputDir)
+-- Writes the JSON layout manifest to manifestPath.
+-- Each entry's path is already the correct relative path from the JSON to the image.
+local function writeManifest(entries, manifestPath)
     -- Sort keys for stable, diffable output
     local keys = {}
     for k in pairs(entries) do table.insert(keys, k) end
@@ -141,17 +141,17 @@ local function writeManifest(scene, entries, outputDir)
     local layerLines = {}
     for _, key in ipairs(keys) do
         local e = entries[key]
-        local mask  = e.mask  and ',\n      "mask": true' or ""
-        local scale = e.scale and string.format(',\n      "scale": [%d, %d]', e.scale[1], e.scale[2]) or ""
+        local mask    = e.mask    and ',\n      "mask": true' or ""
+        local scale   = e.scale   and string.format(',\n      "scale": [%d, %d]', e.scale[1], e.scale[2]) or ""
+        local padding = e.padding and string.format(',\n      "padding": %d', e.padding) or ""
         table.insert(layerLines, string.format(
-            '    "%s": {\n      "path": "%s",\n      "x": %d,\n      "y": %d,\n      "z": %d%s%s\n    }',
-            key, e.filename, e.x, e.y, e.z, mask, scale
+            '    "%s": {\n      "path": "%s",\n      "x": %d,\n      "y": %d,\n      "z": %d%s%s%s\n    }',
+            key, e.path, e.x, e.y, e.z, mask, scale, padding
         ))
     end
 
     local json = '{\n  "layers": {\n' .. table.concat(layerLines, ',\n') .. '\n  }\n}\n'
 
-    local manifestPath = app.fs.joinPath(outputDir, scene .. ".json")
     local f = io.open(manifestPath, "w")
     if not f then
         app.alert("Could not write manifest to:\n" .. manifestPath)
@@ -166,7 +166,14 @@ end
 -- Main export routine
 -- ---------------------------------------------------------------------------
 
+local PREFS_VERSION <const> = 3
+
 local function run(plugin)
+    -- Clear stale preferences when the schema changes.
+    if plugin.preferences.version ~= PREFS_VERSION then
+        plugin.preferences = { version = PREFS_VERSION }
+    end
+
     local spr = app.sprite
     if not spr then
         return app.alert("No active sprite.")
@@ -181,55 +188,122 @@ local function run(plugin)
 
     local dlg = Dialog("Export Layout")
     dlg:entry{
-        id    = "outputPath",
-        label = "Output:",
-        text  = plugin.preferences.outputPath or ".",
+        id      = "jsonOutput",
+        label   = "JSON Output:",
+        text    = plugin.preferences.jsonOutput or "./{sprite}.json",
+        tooltip = "Path for the JSON manifest, relative to the sprite file. Supports {sprite}.",
     }
     dlg:entry{
-        id    = "separator",
-        label = "Separator:",
-        text  = plugin.preferences.separator or "-",
+        id      = "outputPath",
+        label   = "Image Output:",
+        text    = plugin.preferences.outputPath or ".",
+        tooltip = "Folder for exported images, relative to the sprite file. Supports {sprite}.",
+    }
+    dlg:entry{
+        id      = "prefix",
+        label   = "Image Prefix:",
+        text    = plugin.preferences.prefix or "",
+        tooltip = "Prepended to every exported image filename. Supports {sprite}.",
+    }
+    dlg:entry{
+        id      = "separator",
+        label   = "Separator:",
+        text    = plugin.preferences.separator or "-",
+        tooltip = "Character(s) used to join path components in image filenames.",
+    }
+    dlg:slider{
+        id      = "padding",
+        label   = "Padding:",
+        min     = 0,
+        max     = 16,
+        value   = plugin.preferences.padding ~= nil and plugin.preferences.padding or 1,
+        tooltip = "Transparent pixels added around each trimmed image.",
     }
     dlg:separator{}
     dlg:slider{
-        id    = "fromFrame",
-        label = "From frame:",
-        min   = 1,
-        max   = nFrames,
-        value = math.min(plugin.preferences.fromFrame or 1, nFrames),
+        id      = "fromFrame",
+        label   = "From Frame:",
+        min     = 1,
+        max     = nFrames,
+        value   = math.min(plugin.preferences.fromFrame or 1, nFrames),
+        tooltip = "First frame to include in the export.",
     }
     dlg:slider{
-        id    = "toFrame",
-        label = "To frame:",
-        min   = 1,
-        max   = nFrames,
-        value = math.min(plugin.preferences.toFrame or nFrames, nFrames),
+        id      = "toFrame",
+        label   = "To Frame:",
+        min     = 1,
+        max     = nFrames,
+        value   = math.min(plugin.preferences.toFrame or nFrames, nFrames),
+        tooltip = "Last frame to include in the export.",
     }
     dlg:separator{}
     dlg:check{
         id       = "deleteExisting",
-        text     = "Delete existing images in folder",
+        text     = "Delete Existing Images in Folder",
         selected = plugin.preferences.deleteExisting ~= false,
+        tooltip  = "Remove all PNG files in the output folder before exporting.",
     }
     dlg:separator{}
+    dlg:button{
+        text    = "Restore Defaults",
+        onclick = function()
+            dlg:modify{ id = "jsonOutput",  text = "./{sprite}.json" }
+            dlg:modify{ id = "outputPath",  text = "."               }
+            dlg:modify{ id = "prefix",         text     = ""             }
+            dlg:modify{ id = "separator",      text     = "-"            }
+            dlg:modify{ id = "padding",        value    = 1              }
+            dlg:modify{ id = "fromFrame",      value    = 1              }
+            dlg:modify{ id = "toFrame",        value    = nFrames        }
+            dlg:modify{ id = "deleteExisting", selected = true           }
+        end,
+    }
     dlg:button{ id = "ok", text = "Export", focus = true }
     dlg:button{ id = "cancel", text = "Cancel" }
     dlg:show()
 
     if not dlg.data.ok then return end
 
-    plugin.preferences.deleteExisting = dlg.data.deleteExisting
-    plugin.preferences.outputPath     = dlg.data.outputPath
-    plugin.preferences.separator      = dlg.data.separator
-    plugin.preferences.fromFrame      = dlg.data.fromFrame
-    plugin.preferences.toFrame        = dlg.data.toFrame
+    local jsonRel  = dlg.data.jsonOutput:gsub("{sprite}", scene)
+    local jsonPath  -- full path to the manifest file
+    if jsonRel == "" or jsonRel == "." then
+        jsonPath = app.fs.joinPath(spriteDir, scene .. ".json")
+    elseif jsonRel:sub(-5) == ".json" then
+        jsonPath = app.fs.joinPath(spriteDir, jsonRel)
+    else
+        jsonPath = app.fs.joinPath(spriteDir, jsonRel, scene .. ".json")
+    end
+    local jsonDir = app.fs.filePath(jsonPath)
 
-    local relPath   = dlg.data.outputPath
+    local relPath   = dlg.data.outputPath:gsub("{sprite}", scene)
     local outputDir = (relPath == "" or relPath == ".")
         and spriteDir
         or  app.fs.joinPath(spriteDir, relPath)
 
-    local sep       = dlg.data.separator ~= "" and dlg.data.separator or "-"
+    plugin.preferences.version        = PREFS_VERSION
+    plugin.preferences.deleteExisting = dlg.data.deleteExisting
+    plugin.preferences.jsonOutput     = dlg.data.jsonOutput
+    plugin.preferences.outputPath     = dlg.data.outputPath
+    plugin.preferences.prefix         = dlg.data.prefix
+    plugin.preferences.separator      = dlg.data.separator
+    plugin.preferences.padding        = dlg.data.padding
+    plugin.preferences.fromFrame      = dlg.data.fromFrame
+    plugin.preferences.toFrame        = dlg.data.toFrame
+
+    local prefix  = dlg.data.prefix:gsub("{sprite}", scene)
+    local sep     = dlg.data.separator ~= "" and dlg.data.separator or "-"
+    local padding = dlg.data.padding
+
+    -- Returns the path to an image relative to the JSON file location.
+    local function makeImagePath(filename)
+        local f = filename .. ".png"
+        if outputDir == jsonDir then return f end
+        local jd = jsonDir:gsub("\\", "/")
+        local od = outputDir:gsub("\\", "/")
+        if od:sub(1, #jd + 1) == jd .. "/" then
+            return od:sub(#jd + 2) .. "/" .. f
+        end
+        return od .. "/" .. f  -- absolute fallback for unrelated trees
+    end
     local fromFrame = math.min(dlg.data.fromFrame, dlg.data.toFrame)
     local toFrame   = math.max(dlg.data.fromFrame, dlg.data.toFrame)
     local frame     = fromFrame
@@ -292,7 +366,7 @@ local function run(plugin)
     -- Regular instances: deduplicate only when the same leaf name appears more than once.
     for leafName, paths in pairs(regularGroups) do
         if #paths > 1 then
-            local fname = commonPrefixFilename(paths, leafName, scene, sep)
+            local fname = commonPrefixFilename(paths, leafName, prefix, sep)
             for _, p in ipairs(paths) do
                 sharedFilenames[table.concat(p, "-")] = fname
             end
@@ -305,7 +379,7 @@ local function run(plugin)
         local allPaths = {}
         for _, p in ipairs(group.rights) do table.insert(allPaths, p) end
         for _, p in ipairs(group.lefts)  do table.insert(allPaths, p) end
-        local fname = commonPrefixFilename(allPaths, baseName, scene, sep)
+        local fname = commonPrefixFilename(allPaths, baseName, prefix, sep)
         for _, p in ipairs(allPaths) do
             sharedFilenames[table.concat(p, "-")] = fname
         end
@@ -338,7 +412,7 @@ local function run(plugin)
                 if sharedFilenames[baseKey] then
                     filename = sharedFilenames[baseKey]
                 else
-                    local nameParts = { scene }
+                    local nameParts = prefix ~= "" and { prefix } or {}
                     for _, p in ipairs(path) do table.insert(nameParts, p) end
                     filename = table.concat(nameParts, sep)
                     if idx > 1 then filename = filename .. sep .. idx end
@@ -351,13 +425,14 @@ local function run(plugin)
                 elseif leftInstanceKeys[baseKey] then
                     -- Defer: capture position now, add manifest entry after right is exported.
                     table.insert(pendingLeft, {
-                        key = key, filename = filename,
+                        key = key, filename = filename, path = makeImagePath(filename),
                         x = cx, y = cy, z = total - i + 1, mask = asMask,
+                        padding = padding > 0 and padding or nil,
                     })
                 else
                     -- Export the PNG only once per unique filename.
                     if exportedFiles[filename] == nil then
-                        local ok = exportLayerPNG(layer, outputPath, fromFrame, toFrame, spr)
+                        local ok = exportLayerPNG(layer, outputPath, fromFrame, toFrame, spr, padding)
                         exportedFiles[filename] = ok
                         if ok then
                             exported = exported + 1
@@ -367,10 +442,11 @@ local function run(plugin)
                     end
                     if exportedFiles[filename] then
                         manifest[key] = {
-                            filename = filename,
+                            path    = makeImagePath(filename),
                             x = cx, y = cy,
                             z = total - i + 1,
-                            mask = asMask,
+                            mask    = asMask,
+                            padding = padding > 0 and padding or nil,
                         }
                     end
                 end
@@ -381,10 +457,11 @@ local function run(plugin)
         for _, e in ipairs(pendingLeft) do
             if exportedFiles[e.filename] then
                 manifest[e.key] = {
-                    filename = e.filename,
+                    path    = e.path,
                     x = e.x, y = e.y, z = e.z,
-                    mask  = e.mask,
-                    scale = { -1, 1 },
+                    mask    = e.mask,
+                    scale   = { -1, 1 },
+                    padding = e.padding,
                 }
             end
         end
@@ -394,7 +471,7 @@ local function run(plugin)
     -- clearing the dirty flag so the user is not prompted to save.
     app.command.Undo()
 
-    local manifestPath = writeManifest(scene, manifest, outputDir)
+    local manifestPath = writeManifest(manifest, jsonPath)
 
     local summary = string.format("Exported %d layers.\nManifest: %s",
         exported, manifestPath and app.fs.fileName(manifestPath) or "FAILED")
