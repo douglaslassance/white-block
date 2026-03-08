@@ -43,6 +43,20 @@ local function isEffectivelyVisible(layer)
     return true
 end
 
+-- Strips instance-related suffixes ("-left-instance", "-right-instance", "-instance",
+-- or bare "instance") from a layer name, including any trailing separator dash.
+local function cleanName(name)
+    local lname = name:lower()
+    if lname:sub(-#"left-instance") == "left-instance" then
+        return name:sub(1, #name - #"left-instance"):gsub("%-$", "")
+    elseif lname:sub(-#"right-instance") == "right-instance" then
+        return name:sub(1, #name - #"right-instance"):gsub("%-$", "")
+    elseif lname:sub(-#"instance") == "instance" then
+        return name:sub(1, #name - #"instance"):gsub("%-$", "")
+    end
+    return name
+end
+
 -- Returns true if any component of the path ends with "preview" (case-insensitive).
 local function shouldSkip(path)
     for _, part in ipairs(path) do
@@ -444,8 +458,7 @@ local function run(plugin)
     -- Regular instances: deduplicate only when the same leaf name appears more than once.
     for leafName, paths in pairs(regularGroups) do
         if #paths > 1 then
-            -- Strip "instance" suffix from the filename
-            local baseLeafName = leafName:sub(1, #leafName - #"instance")
+            local baseLeafName = cleanName(leafName)
             local fname = commonPrefixFilename(paths, baseLeafName, prefix, sep)
             for _, p in ipairs(paths) do
                 sharedFilenames[table.concat(p, "-")] = fname
@@ -480,11 +493,8 @@ local function run(plugin)
         if sharedFilenames[baseKey] then return sharedFilenames[baseKey] end
         local nameParts = prefix ~= "" and { prefix } or {}
         for _, p in ipairs(path) do
-            local part = p
-            if part:lower():sub(-#"instance") == "instance" then
-                part = part:sub(1, #part - #"instance")
-            end
-            table.insert(nameParts, part)
+            local part = cleanName(p)
+            if part ~= "" then table.insert(nameParts, part) end
         end
         return table.concat(nameParts, sep)
     end
@@ -529,7 +539,7 @@ local function run(plugin)
                                 local cx = math.floor((bx1 + bx2) / 2 + 0.5)
                                 local cy = math.floor((by1 + by2) / 2 + 0.5)
                                 table.insert(result, {
-                                    name     = layer.name,
+                                    name     = cleanName(layer.name),
                                     x        = cx - parentCX,
                                     y        = cy - parentCY,
                                     children = buildHierarchyNode(layer, cx, cy),
@@ -548,7 +558,7 @@ local function run(plugin)
                                     table.insert(pendingLeft, {
                                         arr     = result,
                                         pos     = pos,
-                                        name    = layer.name,
+                                        name    = cleanName(layer.name),
                                         filename = filename,
                                         imgPath = makeImagePath(filename),
                                         x = cx - parentCX, y = cy - parentCY,
@@ -558,7 +568,7 @@ local function run(plugin)
                                 else
                                     if exportLeaf(layer, filename) then
                                         table.insert(result, {
-                                            name    = layer.name,
+                                            name    = cleanName(layer.name),
                                             image   = makeImagePath(filename),
                                             x = cx - parentCX, y = cy - parentCY,
                                             mask    = isMask or nil,
@@ -610,7 +620,15 @@ local function run(plugin)
                     local baseKey = table.concat(path, "-")
                     pathIndex[baseKey] = (pathIndex[baseKey] or 0) + 1
                     local idx = pathIndex[baseKey]
-                    local name = idx == 1 and baseKey or (baseKey .. "-" .. idx)
+                    local cleanKey = table.concat((function()
+                        local parts = {}
+                        for _, p in ipairs(path) do
+                            local c = cleanName(p)
+                            if c ~= "" then table.insert(parts, c) end
+                        end
+                        return parts
+                    end)(), "-")
+                    local name = idx == 1 and cleanKey or (cleanKey .. "-" .. idx)
                     local filename = makeFilename(path, baseKey)
                     if not sharedFilenames[baseKey] and idx > 1 then
                         filename = filename .. sep .. idx
