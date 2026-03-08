@@ -45,12 +45,25 @@ end
 
 -- Strips instance-related suffixes ("-left-instance", "-right-instance", "-instance",
 -- or bare "instance") from a layer name, including any trailing separator dash.
+-- Used for image filenames where left/right share the same file.
 local function cleanName(name)
     local lname = name:lower()
     if lname:sub(-#"left-instance") == "left-instance" then
         return name:sub(1, #name - #"left-instance"):gsub("%-$", "")
     elseif lname:sub(-#"right-instance") == "right-instance" then
         return name:sub(1, #name - #"right-instance"):gsub("%-$", "")
+    elseif lname:sub(-#"instance") == "instance" then
+        return name:sub(1, #name - #"instance"):gsub("%-$", "")
+    end
+    return name
+end
+
+-- Strips only the "-instance" suffix from a layer name, preserving directional
+-- prefixes ("left", "right") so JSON name fields can differentiate mirrored pairs.
+local function cleanDisplayName(name)
+    local lname = name:lower()
+    if lname:sub(-#"-instance") == "-instance" then
+        return name:sub(1, #name - #"-instance")
     elseif lname:sub(-#"instance") == "instance" then
         return name:sub(1, #name - #"instance"):gsub("%-$", "")
     end
@@ -539,7 +552,7 @@ local function run(plugin)
                                 local cx = math.floor((bx1 + bx2) / 2 + 0.5)
                                 local cy = math.floor((by1 + by2) / 2 + 0.5)
                                 table.insert(result, {
-                                    name     = cleanName(layer.name),
+                                    name     = cleanDisplayName(layer.name),
                                     x        = cx - parentCX,
                                     y        = cy - parentCY,
                                     children = buildHierarchyNode(layer, cx, cy),
@@ -558,7 +571,7 @@ local function run(plugin)
                                     table.insert(pendingLeft, {
                                         arr     = result,
                                         pos     = pos,
-                                        name    = cleanName(layer.name),
+                                        name    = cleanDisplayName(layer.name),
                                         filename = filename,
                                         imgPath = makeImagePath(filename),
                                         x = cx - parentCX, y = cy - parentCY,
@@ -568,7 +581,7 @@ local function run(plugin)
                                 else
                                     if exportLeaf(layer, filename) then
                                         table.insert(result, {
-                                            name    = cleanName(layer.name),
+                                            name    = cleanDisplayName(layer.name),
                                             image   = makeImagePath(filename),
                                             x = cx - parentCX, y = cy - parentCY,
                                             mask    = isMask or nil,
@@ -623,7 +636,7 @@ local function run(plugin)
                     local cleanKey = table.concat((function()
                         local parts = {}
                         for _, p in ipairs(path) do
-                            local c = cleanName(p)
+                            local c = cleanDisplayName(p)
                             if c ~= "" then table.insert(parts, c) end
                         end
                         return parts
