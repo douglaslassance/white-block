@@ -140,6 +140,46 @@ local function getGroupBounds(container, frame)
     return minX, minY, maxX, maxY
 end
 
+-- Returns the union bounding box (minX, minY, maxX, maxY) across frames [f1, f2] of
+-- all siblings that are below `layer` in its parent container (i.e. lower z-order).
+-- Preview layers (and their descendants) are excluded via shouldSkip.
+-- Returns nil when no such sibling has visible content.
+local function getMaskBounds(layer, f1, f2)
+    local parent = layer.parent
+    local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
+    local function expandBounds(bx1, by1, bx2, by2)
+        if bx1 < minX then minX = bx1 end
+        if by1 < minY then minY = by1 end
+        if bx2 > maxX then maxX = bx2 end
+        if by2 > maxY then maxY = by2 end
+    end
+    for f = f1, f2 do
+        for _, sibling in ipairs(parent.layers) do
+            if sibling == layer then break end
+            if isEffectivelyVisible(sibling) and not shouldSkip(getPath(sibling)) then
+                if sibling.isGroup then
+                    local bx1, by1, bx2, by2 = getGroupBounds(sibling, f)
+                    if bx1 then expandBounds(bx1, by1, bx2, by2) end
+                elseif sibling.isImage then
+                    local cel = sibling:cel(f)
+                    if cel then
+                        local tr = cel.image:shrinkBounds()
+                        if tr.width > 0 and tr.height > 0 then
+                            expandBounds(
+                                cel.position.x + tr.x,
+                                cel.position.y + tr.y,
+                                cel.position.x + tr.x + tr.width,
+                                cel.position.y + tr.y + tr.height)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if minX == math.huge then return nil end
+    return minX, minY, maxX, maxY
+end
+
 -- Given a set of full layer paths and a target leaf name, returns the deduplicated
 -- filename stem: scene + longest-common-prefix-of-all-paths + leafName.
 local function commonPrefixFilename(paths, leafName, prefix, sep)
@@ -190,6 +230,54 @@ local function getUniqueFrames(layer, f1, f2)
         end
     end
     return nums
+end
+
+-- Exports a mask layer as a fixed-size PNG whose canvas equals the bounding box
+-- of the lower siblings (bx1,by1)-(bx2,by2) expanded by `padding` on each side.
+-- The mask's pixel content is composited into the correct canvas position.
+-- No trim is applied; the canvas dimensions are authoritative.
+local function exportMaskLayerPNG(layer, outputPath, fromFrame, toFrame, spr, padding, bx1, by1, bx2, by2)
+    local canvasW = bx2 - bx1 + 2 * padding
+    local canvasH = by2 - by1 + 2 * padding
+    if canvasW <= 0 or canvasH <= 0 then return false end
+
+    local uniqueNums = getUniqueFrames(layer, fromFrame, toFrame)
+    if #uniqueNums == 0 then return false end
+
+    local sentinel = "__wb_export_target__"
+    local tmpSpr   = Sprite(canvasW, canvasH, spr.colorMode)
+    local tmpLayer = tmpSpr.layers[1]
+    tmpLayer.name  = sentinel
+    while #tmpSpr.frames < #uniqueNums do tmpSpr:newFrame() end
+    for i, f in ipairs(uniqueNums) do
+        local cel = layer:cel(f)
+        if cel then
+            local pos = Point(cel.position.x - bx1 + padding, cel.position.y - by1 + padding)
+            tmpSpr:newCel(tmpLayer, i, cel.image, pos)
+        end
+    end
+    local tag = tmpSpr:newTag(1, #uniqueNums)
+    tag.name = "__wb_export__"
+    pcall(function()
+        app.command.ExportSpriteSheet{
+            ui              = false,
+            type            = SpriteSheetType.HORIZONTAL,
+            textureFilename = outputPath,
+            dataFilename    = "",
+            layer           = sentinel,
+            tag             = "__wb_export__",
+            trim            = false,
+            borderPadding   = 0,
+            innerPadding    = 0,
+            ignoreEmpty     = false,
+            splitLayers     = false,
+            listLayers      = false,
+            listTags        = false,
+            listSlices      = false,
+        }
+    end)
+    pcall(function() tmpSpr:close() end)
+    return app.fs.isFile(outputPath)
 end
 
 -- Exports a single layer over a frame range as a trimmed PNG.
@@ -630,16 +718,51 @@ local function run(plugin)
                                 })
                             end
                         elseif layer.isImage then
-                            local cx, cy = getCenter(layer, frame)
-                            if cx then
-                                local lname  = layer.name:lower()
-                                local isText = lname:sub(-#"text") == "text"
-                                if isText then
+                            local lname  = layer.name:lower()
+                            local isText = lname:sub(-#"text") == "text"
+                            local isMask = lname:sub(-#"mask") == "mask"
+                            if isText then
+                                local cx, cy = getCenter(layer, frame)
+                                if cx then
                                     table.insert(result, {
                                         name = cleanDisplayName(layer.name),
                                         x = cx - parentCX, y = cy - parentCY,
                                     })
                                 else
+                                    table.insert(warnings, "Empty layer skipped: " .. layer.name)
+                                end
+                            elseif isMask then
+                                local bx1, by1, bx2, by2 = getMaskBounds(layer, fromFrame, toFrame)
+                                if bx1 then
+                                    local cx = math.floor((bx1 + bx2) / 2 + 0.5)
+                                    local cy = math.floor((by1 + by2) / 2 + 0.5)
+                                    local baseKey  = table.concat(path, "-")
+                                    local nUnique  = #getUniqueFrames(layer, fromFrame, toFrame)
+                                    local canvasW  = bx2 - bx1 + 2 * padding
+                                    local canvasH  = by2 - by1 + 2 * padding
+                                    local suffix   = nUnique > 1 and string.format("-table-%d-%d", canvasW, canvasH) or ""
+                                    local filename = makeFilename(path, baseKey) .. suffix
+                                    local outPath  = app.fs.joinPath(outputDir, filename .. ".png")
+                                    if exportedFiles[filename] == nil then
+                                        local ok = exportMaskLayerPNG(layer, outPath, fromFrame, toFrame, spr, padding, bx1, by1, bx2, by2)
+                                        exportedFiles[filename] = ok
+                                        if ok then exported = exported + 1
+                                        else table.insert(warnings, "Export failed: " .. layer.name) end
+                                    end
+                                    if exportedFiles[filename] then
+                                        table.insert(result, {
+                                            name    = cleanDisplayName(layer.name),
+                                            image   = makeImagePath(filename),
+                                            x = cx - parentCX, y = cy - parentCY,
+                                            padding = padding > 0 and padding or nil,
+                                        })
+                                    end
+                                else
+                                    table.insert(warnings, "Mask has no layers below it: " .. layer.name)
+                                end
+                            else
+                                local cx, cy = getCenter(layer, frame)
+                                if cx then
                                     local baseKey  = table.concat(path, "-")
                                     local filename = makeFilename(path, baseKey) .. tableSuffix(layer)
                                     if leftInstanceKeys[baseKey] then
@@ -665,9 +788,9 @@ local function run(plugin)
                                             })
                                         end
                                     end
+                                else
+                                    table.insert(warnings, "Empty layer skipped: " .. layer.name)
                                 end
-                            else
-                                table.insert(warnings, "Empty layer skipped: " .. layer.name)
                             end
                         end
                     end
@@ -707,6 +830,7 @@ local function run(plugin)
                 if not shouldSkip(path) then
                     local lname  = layer.name:lower()
                     local isText = lname:sub(-#"text") == "text"
+                    local isMask = lname:sub(-#"mask") == "mask"
                     local baseKey = table.concat(path, "-")
                     pathIndex[baseKey] = (pathIndex[baseKey] or 0) + 1
                     local idx = pathIndex[baseKey]
@@ -719,40 +843,72 @@ local function run(plugin)
                         return parts
                     end)(), "-")
                     local name = idx == 1 and cleanKey or (cleanKey .. "-" .. idx)
-                    local cx, cy = getCenter(layer, frame)
-                    if cx == nil then
-                        table.insert(warnings, "Empty layer skipped: " .. layer.name)
-                    elseif isText then
-                        table.insert(manifest, {
-                            name = name,
-                            x = cx, y = cy,
-                        })
-                    else
-                        local filename = makeFilename(path, baseKey) .. tableSuffix(layer)
-                        if not sharedFilenames[baseKey] and idx > 1 then
-                            filename = filename .. sep .. idx
-                        end
-                        if leftInstanceKeys[baseKey] then
-                            -- Reserve a slot; fill after the right-instance is exported.
-                            local pos = #manifest + 1
-                            manifest[pos] = false
-                            table.insert(pendingLeft, {
-                                arr      = manifest,
-                                pos      = pos,
-                                name     = name,
-                                filename = filename,
-                                imgPath  = makeImagePath(filename),
-                                x = cx, y = cy,
-                                padding = padding > 0 and padding or nil,
-                            })
+                    if isText then
+                        local cx, cy = getCenter(layer, frame)
+                        if cx then
+                            table.insert(manifest, { name = name, x = cx, y = cy })
                         else
-                            if exportLeaf(layer, filename) then
+                            table.insert(warnings, "Empty layer skipped: " .. layer.name)
+                        end
+                    elseif isMask then
+                        local bx1, by1, bx2, by2 = getMaskBounds(layer, fromFrame, toFrame)
+                        if bx1 then
+                            local cx       = math.floor((bx1 + bx2) / 2 + 0.5)
+                            local cy       = math.floor((by1 + by2) / 2 + 0.5)
+                            local nUnique  = #getUniqueFrames(layer, fromFrame, toFrame)
+                            local canvasW  = bx2 - bx1 + 2 * padding
+                            local canvasH  = by2 - by1 + 2 * padding
+                            local suffix   = nUnique > 1 and string.format("-table-%d-%d", canvasW, canvasH) or ""
+                            local filename = makeFilename(path, baseKey) .. suffix
+                            local outPath  = app.fs.joinPath(outputDir, filename .. ".png")
+                            if exportedFiles[filename] == nil then
+                                local ok = exportMaskLayerPNG(layer, outPath, fromFrame, toFrame, spr, padding, bx1, by1, bx2, by2)
+                                exportedFiles[filename] = ok
+                                if ok then exported = exported + 1
+                                else table.insert(warnings, "Export failed: " .. layer.name) end
+                            end
+                            if exportedFiles[filename] then
                                 table.insert(manifest, {
                                     name    = name,
                                     image   = makeImagePath(filename),
                                     x = cx, y = cy,
                                     padding = padding > 0 and padding or nil,
                                 })
+                            end
+                        else
+                            table.insert(warnings, "Mask has no layers below it: " .. layer.name)
+                        end
+                    else
+                        local cx, cy = getCenter(layer, frame)
+                        if cx == nil then
+                            table.insert(warnings, "Empty layer skipped: " .. layer.name)
+                        else
+                            local filename = makeFilename(path, baseKey) .. tableSuffix(layer)
+                            if not sharedFilenames[baseKey] and idx > 1 then
+                                filename = filename .. sep .. idx
+                            end
+                            if leftInstanceKeys[baseKey] then
+                                -- Reserve a slot; fill after the right-instance is exported.
+                                local pos = #manifest + 1
+                                manifest[pos] = false
+                                table.insert(pendingLeft, {
+                                    arr      = manifest,
+                                    pos      = pos,
+                                    name     = name,
+                                    filename = filename,
+                                    imgPath  = makeImagePath(filename),
+                                    x = cx, y = cy,
+                                    padding = padding > 0 and padding or nil,
+                                })
+                            else
+                                if exportLeaf(layer, filename) then
+                                    table.insert(manifest, {
+                                        name    = name,
+                                        image   = makeImagePath(filename),
+                                        x = cx, y = cy,
+                                        padding = padding > 0 and padding or nil,
+                                    })
+                                end
                             end
                         end
                     end
