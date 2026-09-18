@@ -1,27 +1,9 @@
--- White Block — Aseprite Extension
--- Exports each visible leaf layer as an individual trimmed PNG and generates
--- a Lua layout manifest with canvas-space center positions for sprite.moveTo().
---
--- Naming:  {scene}-{group}-{subgroup}-{layer}.png  (groups joined with dashes)
--- Rules:
---   Hidden layers are not exported.
---   Layers/groups whose name ends with "preview" are skipped (children too).
---   Layers whose name ends with "mask" are exported normally; the name identifies them.
---   Groups are never exported as composites — only used for naming.
 
--- ---------------------------------------------------------------------------
--- Helpers
--- ---------------------------------------------------------------------------
-
--- Aseprite throws (not nil) when accessing a field that doesn't exist on userdata.
--- Sprites have no .name, so walking up to the root via layer.parent needs a guard.
 local function isLayer(obj)
     local ok = pcall(function() return obj.name end)
     return ok
 end
 
--- Returns the ancestor chain as an ordered array, e.g. {"water", "background"}.
--- Does not include the sprite root.
 local function getPath(layer)
     local path = {}
     local cur = layer
@@ -32,7 +14,6 @@ local function getPath(layer)
     return path
 end
 
--- Returns true only if the layer AND all its ancestor groups are visible.
 local function isEffectivelyVisible(layer)
     if not layer.isVisible then return false end
     local parent = layer.parent
@@ -43,9 +24,6 @@ local function isEffectivelyVisible(layer)
     return true
 end
 
--- Strips instance-related suffixes ("-left-instance", "-right-instance", "-instance",
--- or bare "instance") from a layer name, including any trailing separator dash.
--- Used for image filenames where left/right share the same file.
 local function cleanName(name)
     local lname = name:lower()
     if lname:sub(-#"left-instance") == "left-instance" then
@@ -58,8 +36,7 @@ local function cleanName(name)
     return name
 end
 
--- Strips instance suffixes ("-instance") from a layer name for JSON display,
--- preserving directional prefixes ("left", "right") so mirrored pairs stay distinct.
+-- Keeps directional prefixes so mirrored pairs stay distinct.
 local function cleanDisplayName(name)
     local lname = name:lower()
     if lname:sub(-#"-instance") == "-instance" then
@@ -70,7 +47,6 @@ local function cleanDisplayName(name)
     return name
 end
 
--- Returns true if any component of the path ends with "preview" (case-insensitive).
 local function shouldSkip(path)
     for _, part in ipairs(path) do
         if part:lower():sub(-#"preview") == "preview" then return true end
@@ -78,8 +54,6 @@ local function shouldSkip(path)
     return false
 end
 
--- Recursively collects visible image leaf layers, top-most first.
--- Iterates in reverse so that the first result is the topmost (highest z) layer.
 local function collectLeaves(container, result)
     result = result or {}
     for i = #container.layers, 1, -1 do
@@ -93,8 +67,6 @@ local function collectLeaves(container, result)
     return result
 end
 
--- Returns the canvas-space center (x, y) of a layer's trimmed content.
--- Returns nil if the layer has no visible content.
 local function getCenter(layer, frame)
     local cel = layer:cel(frame)
     if not cel then return nil end
@@ -105,9 +77,6 @@ local function getCenter(layer, frame)
     return cx, cy
 end
 
--- Returns the canvas-space bounding box (minX, minY, maxX, maxY) of all visible,
--- non-skipped image leaf descendants of a container for the given frame.
--- Returns nil when the container has no visible content.
 local function getGroupBounds(container, frame)
     local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
     local function visit(c)
@@ -140,10 +109,6 @@ local function getGroupBounds(container, frame)
     return minX, minY, maxX, maxY
 end
 
--- Returns the union bounding box (minX, minY, maxX, maxY) across frames [f1, f2] of
--- all siblings that are below `layer` in its parent container (i.e. lower z-order).
--- Preview layers (and their descendants) are excluded via shouldSkip.
--- Returns nil when no such sibling has visible content.
 local function getMaskBounds(layer, f1, f2)
     local parent = layer.parent
     local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
@@ -180,8 +145,6 @@ local function getMaskBounds(layer, f1, f2)
     return minX, minY, maxX, maxY
 end
 
--- Given a set of full layer paths and a target leaf name, returns the deduplicated
--- filename stem: scene + longest-common-prefix-of-all-paths + leafName.
 local function commonPrefixFilename(paths, leafName, prefix, sep)
     local maxPrefix = math.huge
     for _, p in ipairs(paths) do maxPrefix = math.min(maxPrefix, #p - 1) end
@@ -199,7 +162,6 @@ local function commonPrefixFilename(paths, leafName, prefix, sep)
     return table.concat(parts, sep)
 end
 
--- Returns true when two cels contain identical pixel content.
 local function celsMatch(cel1, cel2)
     local i1, i2 = cel1.image, cel2.image
     if i1.width ~= i2.width or i1.height ~= i2.height then return false end
@@ -211,8 +173,6 @@ local function celsMatch(cel1, cel2)
     return true
 end
 
--- Returns an ordered array of frame numbers in [f1, f2] whose pixel content is
--- unique (i.e. not pixel-equal to any earlier frame already in the list).
 local function getUniqueFrames(layer, f1, f2)
     local nums = {}
     local cels = {}
@@ -232,10 +192,6 @@ local function getUniqueFrames(layer, f1, f2)
     return nums
 end
 
--- Exports a mask layer as a fixed-size PNG whose canvas equals the bounding box
--- of the lower siblings (bx1,by1)-(bx2,by2) expanded by `padding` on each side.
--- The mask's pixel content is composited into the correct canvas position.
--- No trim is applied; the canvas dimensions are authoritative.
 local function exportMaskLayerPNG(layer, outputPath, fromFrame, toFrame, spr, padding, bx1, by1, bx2, by2)
     local canvasW = bx2 - bx1 + 2 * padding
     local canvasH = by2 - by1 + 2 * padding
@@ -280,11 +236,7 @@ local function exportMaskLayerPNG(layer, outputPath, fromFrame, toFrame, spr, pa
     return app.fs.isFile(outputPath)
 end
 
--- Exports a single layer over a frame range as a trimmed PNG.
--- The layer is temporarily renamed to a sentinel name so ExportSpriteSheet's
--- `layer` filter matches exactly one layer regardless of name collisions.
--- pcall ensures the original name and tag are always restored on failure.
--- Sprite:newTag uses 1-indexed frame numbers (Lua convention).
+-- Renamed to a sentinel so ExportSpriteSheet `layer` filter matches exactly one layer.
 local function exportLayerPNG(layer, outputPath, fromFrame, toFrame, spr, padding)
     local origName = layer.name
     local sentinel = "__wb_export_target__"
@@ -294,8 +246,6 @@ local function exportLayerPNG(layer, outputPath, fromFrame, toFrame, spr, paddin
 
     layer.name = sentinel
 
-    -- When some frames are linked, build a temp sprite containing only unique frames
-    -- so the exported strip has no duplicate columns.
     local tmpSpr
     if #uniqueNums < toFrame - fromFrame + 1 then
         tmpSpr = Sprite(spr.width, spr.height, spr.colorMode)
@@ -336,10 +286,7 @@ local function exportLayerPNG(layer, outputPath, fromFrame, toFrame, spr, paddin
     return app.fs.isFile(outputPath)
 end
 
-
--- Serializes a hierarchy node to a JSON string with `indent` levels of indentation.
--- Group nodes carry { name, x, y, children }; image nodes carry { name, image, x, y, ... };
--- text nodes carry { name, x, y }. false entries in children are skipped (pending placeholders).
+-- Group nodes carry { name, x, y, children }; image nodes carry { name, image, x, y }.
 local function nodeToJson(node, indent)
     local pad      = string.rep("  ", indent)
     local outerPad = indent > 0 and string.rep("  ", indent - 1) or ""
@@ -375,8 +322,7 @@ local function nodeToJson(node, indent)
     return '{\n' .. pad .. table.concat(parts, ',\n' .. pad) .. '\n' .. outerPad .. '}'
 end
 
--- Writes a hierarchical JSON layout manifest to manifestPath.
--- root is an ordered array of nodes (bottom-to-top).
+-- root is an ordered array of nodes, bottom-to-top.
 local function writeHierarchicalManifest(root, manifestPath)
     local lines = {}
     for _, node in ipairs(root) do
@@ -395,14 +341,9 @@ local function writeHierarchicalManifest(root, manifestPath)
     return manifestPath
 end
 
--- ---------------------------------------------------------------------------
--- Main export routine
--- ---------------------------------------------------------------------------
-
 local PREFS_VERSION <const> = 4
 
 local function run(plugin)
-    -- Clear stale preferences when the schema changes.
     if plugin.preferences.version ~= PREFS_VERSION then
         plugin.preferences = { version = PREFS_VERSION }
     end
@@ -559,7 +500,6 @@ local function run(plugin)
     local toFrame   = math.max(dlg.data.fromFrame, dlg.data.toFrame)
     local frame     = fromFrame
 
-    -- Collect valid leaf layers (topmost first → highest z)
     local leaves = collectLeaves(spr)
     local total  = #leaves
 
@@ -576,14 +516,6 @@ local function run(plugin)
         end
     end
 
-    -- Pre-pass: classify instance layers and compute shared filenames.
-    --
-    -- "instance" suffix → reusable symbol; all occurrences share one PNG named by
-    --   scene + common-prefix-of-all-paths + leaf-name.
-    --
-    -- "left-instance" / "right-instance" suffix → mirrored pair; only the right
-    --   image is exported (using the base name, both suffixes stripped). The left
-    --   entry references the same file with scale [-1, 1] applied.
     local sharedFilenames = {}  -- pathKey → filename stem (no extension)
     local leftInstanceKeys = {} -- pathKey → true  (these entries get scale [-1, 1])
 
@@ -625,8 +557,6 @@ local function run(plugin)
         end
     end
 
-    -- Directional instances: always deduplicate (left + right share one file).
-    -- The exported filename uses the base name (both directional and instance suffixes dropped).
     for baseName, group in pairs(directionalGroups) do
         local allPaths = {}
         for _, p in ipairs(group.rights) do table.insert(allPaths, p) end
@@ -647,9 +577,7 @@ local function run(plugin)
     local exportedFiles = {}   -- filename → true/false
     local pendingLeft   = {}   -- left-instance entries deferred until after right exports
 
-    -- Returns the Playdate image-table suffix ("-table-W-H") when a layer has more
-    -- than one unique frame in the export range, otherwise returns "".
-    -- W and H are the dimensions of a single frame (trimmed content + padding on each side).
+    -- The Playdate image-table suffix "-table-W-H", or "" for a single unique frame.
     local function tableSuffix(layer)
         local unique = getUniqueFrames(layer, fromFrame, toFrame)
         if #unique <= 1 then return "" end
@@ -660,7 +588,6 @@ local function run(plugin)
         return string.format("-table-%d-%d", tr.width + 2 * padding, tr.height + 2 * padding)
     end
 
-    -- Returns the filename stem for a leaf layer, honouring shared-instance overrides.
     local function makeFilename(path, baseKey)
         if sharedFilenames[baseKey] then return sharedFilenames[baseKey] end
         local nameParts = prefix ~= "" and { prefix } or {}
@@ -671,7 +598,6 @@ local function run(plugin)
         return table.concat(nameParts, sep)
     end
 
-    -- Exports a leaf PNG once per unique filename (deduped via exportedFiles).
     local function exportLeaf(layer, filename)
         if exportedFiles[filename] ~= nil then return exportedFiles[filename] end
         local outputPath = app.fs.joinPath(outputDir, filename .. ".png")
@@ -685,21 +611,11 @@ local function run(plugin)
         return ok
     end
 
-    -- Wrap all layer renames in a single transaction so one Undo call below can
-    -- revert them all, restoring the document to its pre-export state (no dirty flag).
     local manifestPath
     if groupTransform then
-        -- -----------------------------------------------------------------------
-        -- Hierarchical mode: groups become parent transform nodes.
-        -- Positions of children are relative to their parent's center.
-        -- Output is ordered arrays (bottom-to-top); draw order is implicit.
-        -- -----------------------------------------------------------------------
 
-        -- Recursively builds an ordered array of nodes for a container's children.
-        -- parentCX/parentCY: canvas-space center of the parent (0,0 at root).
         local function buildHierarchyNode(container, parentCX, parentCY)
             local result = {}
-            -- Iterate bottom-to-top (index 1 = bottommost in Aseprite).
             for i = 1, #container.layers do
                 local layer = container.layers[i]
                 if isEffectivelyVisible(layer) then
@@ -766,7 +682,6 @@ local function run(plugin)
                                     local baseKey  = table.concat(path, "-")
                                     local filename = makeFilename(path, baseKey) .. tableSuffix(layer)
                                     if leftInstanceKeys[baseKey] then
-                                        -- Reserve a slot; fill after the right-instance is exported.
                                         local pos = #result + 1
                                         result[pos] = false
                                         table.insert(pendingLeft, {
@@ -817,13 +732,9 @@ local function run(plugin)
         app.command.Undo()
         manifestPath = writeHierarchicalManifest(hierarchicalManifest, jsonPath)
     else
-        -- -----------------------------------------------------------------------
-        -- Flat mode: one entry per leaf, ordered bottom-to-top.
-        -- -----------------------------------------------------------------------
         local manifest  = {}
         local pathIndex = {}   -- baseKey → occurrence count (handles path collisions)
         app.transaction("White Block Export", function()
-            -- leaves[1] is topmost; iterate in reverse for bottom-to-top array order.
             for i = total, 1, -1 do
                 local layer = leaves[i]
                 local path = getPath(layer)
@@ -888,7 +799,6 @@ local function run(plugin)
                                 filename = filename .. sep .. idx
                             end
                             if leftInstanceKeys[baseKey] then
-                                -- Reserve a slot; fill after the right-instance is exported.
                                 local pos = #manifest + 1
                                 manifest[pos] = false
                                 table.insert(pendingLeft, {
@@ -914,7 +824,6 @@ local function run(plugin)
                     end
                 end
             end
-            -- Fill in deferred left-instance slots.
             for _, e in ipairs(pendingLeft) do
                 if exportedFiles[e.filename] then
                     e.arr[e.pos] = {
@@ -927,8 +836,6 @@ local function run(plugin)
                 end
             end
         end)
-        -- Undo the transaction to restore the document to its pre-export state,
-        -- clearing the dirty flag so the user is not prompted to save.
         app.command.Undo()
         manifestPath = writeHierarchicalManifest(manifest, jsonPath)
     end
@@ -939,10 +846,6 @@ local function run(plugin)
         app.alert("Warnings:\n• " .. table.concat(warnings, "\n• "))
     end
 end
-
--- ---------------------------------------------------------------------------
--- Extension lifecycle
--- ---------------------------------------------------------------------------
 
 function init(plugin)
     plugin:newMenuGroup{
